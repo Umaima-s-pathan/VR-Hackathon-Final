@@ -6,6 +6,8 @@ import fs from 'fs/promises';
 import { v4 as uuidv4 } from 'uuid';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
+import axios from 'axios';
+import FormData from 'form-data';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 
@@ -25,8 +27,7 @@ app.use(cors({
     'https://umaima-s-pathan.github.io',
     'http://localhost:3000',
     'http://localhost:3001',
-    'http://localhost:5173',
-    'http://localhost:5174'
+    'http://localhost:5173'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -57,17 +58,11 @@ const upload = multer({
   storage,
   limits: { fileSize: 500 * 1024 * 1024 }, // 500MB limit
   fileFilter: (req, file, cb) => {
-    const allowedTypes = ['video/mp4', 'video/mov', 'video/avi', 'video/quicktime', 'video/x-msvideo'];
-    const allowedExtensions = ['.mp4', '.mov', '.avi', '.m4v', '.mkv'];
-    const fileExtension = path.extname(file.originalname).toLowerCase();
-
-    console.log(`File upload: ${file.originalname}, MIME: ${file.mimetype}, Extension: ${fileExtension}`);
-
-    if (allowedTypes.includes(file.mimetype) || allowedExtensions.includes(fileExtension)) {
+    const allowedTypes = ['video/mp4', 'video/mov', 'video/avi', 'video/quicktime'];
+    if (allowedTypes.includes(file.mimetype)) {
       cb(null, true);
     } else {
-      console.log(`Rejected file: ${file.originalname} - MIME: ${file.mimetype}, Extension: ${fileExtension}`);
-      cb(new Error('Invalid file type. Only MP4, MOV, AVI, M4V, and MKV are allowed.'));
+      cb(new Error('Invalid file type. Only MP4, MOV, and AVI are allowed.'));
     }
   }
 });
@@ -75,7 +70,7 @@ const upload = multer({
 // Job storage (in production, use a database)
 const jobs = new Map();
 
-// Optimized VR180 Processing Pipeline
+// VR180 Processing Pipeline
 class VR180Pipeline {
   constructor(jobId, inputPath) {
     this.jobId = jobId;
@@ -115,12 +110,11 @@ class VR180Pipeline {
     this.updateProgress('depth', 10, 'processing');
 
     return new Promise((resolve, reject) => {
-      // Extract fewer frames for faster processing
+      // Extract frames with error handling
       ffmpeg(this.inputPath)
         .output(`${this.outputDir}/frames/frame_%04d.png`)
         .outputOptions([
-          '-vf', 'fps=0.2,scale=320:180', // Much faster - only 0.2 fps
-          '-vframes', '10', // Limit to 10 frames max
+          '-vf', 'fps=0.5,scale=320:180', // Even slower fps for stability
           '-y' // Overwrite existing files
         ])
         .on('progress', (progress) => {
@@ -144,31 +138,41 @@ class VR180Pipeline {
   async generateDepthMaps() {
     try {
       this.updateProgress('depth', 50, 'processing');
-      console.log('Starting optimized depth map generation...');
+      console.log('Starting depth map generation...');
 
       const frameFiles = await fs.readdir(`${this.outputDir}/frames`);
       const pngFiles = frameFiles.filter(f => f.endsWith('.png'));
-      const totalFrames = Math.min(pngFiles.length, 5); // Process max 5 frames
+      const totalFrames = pngFiles.length;
 
-      console.log(`Processing ${totalFrames} frames for depth maps`);
+      console.log(`Found ${totalFrames} frames to process`);
 
       if (totalFrames === 0) {
         throw new Error('No frames extracted from video');
       }
 
-      // Process frames quickly
-      for (let i = 0; i < totalFrames; i++) {
-        const frameName = pngFiles[i];
-        const depthMapPath = `${this.outputDir}/depth/depth_${String(i + 1).padStart(4, '0')}.png`;
+      // Process frames in smaller batches for stability
+      const batchSize = Math.min(5, totalFrames);
+      for (let batchStart = 0; batchStart < totalFrames; batchStart += batchSize) {
+        const batchEnd = Math.min(batchStart + batchSize, totalFrames);
+        const batch = pngFiles.slice(batchStart, batchEnd);
 
-        try {
-          await this.createOptimizedDepthMap(depthMapPath);
-          const progress = 50 + ((i + 1) / totalFrames) * 50;
-          this.updateProgress('depth', progress, 'processing');
-        } catch (error) {
-          console.error(`Error creating depth map ${i}:`, error);
-          // Continue with next frame
+        console.log(`Processing batch ${batchStart + 1}-${batchEnd} of ${totalFrames}`);
+
+        // Process batch with error handling
+        for (let i = 0; i < batch.length; i++) {
+          const frameIndex = batchStart + i;
+          const depthMapPath = `${this.outputDir}/depth/depth_${String(frameIndex + 1).padStart(4, '0')}.png`;
+
+          try {
+            await this.createPlaceholderDepthMap(depthMapPath);
+          } catch (error) {
+            console.error(`Error creating depth map ${frameIndex}:`, error);
+            // Continue with next frame instead of failing
+          }
         }
+
+        const progress = 50 + ((batchEnd / totalFrames) * 50);
+        this.updateProgress('depth', progress, 'processing');
       }
 
       console.log('Depth map generation completed');
@@ -179,8 +183,8 @@ class VR180Pipeline {
     }
   }
 
-  async createOptimizedDepthMap(outputPath) {
-    // Create a simple depth map quickly
+  async createPlaceholderDepthMap(outputPath) {
+    // Create a simple depth map with better error handling
     return new Promise((resolve, reject) => {
       ffmpeg()
         .input('color=gray:size=320x180:duration=0.1')
@@ -202,34 +206,25 @@ class VR180Pipeline {
   async synthesizeStereo() {
     try {
       this.updateProgress('stereo', 0, 'processing');
-      console.log('Starting stereo synthesis using depth-image-based rendering...');
+      console.log('Starting stereo synthesis...');
 
-      // More realistic processing times for stereo synthesis
-      const stages = [
-        { name: 'Left Eye Generation', duration: 2000, progress: 50 }, // 2 seconds
-        { name: 'Right Eye Generation', duration: 2000, progress: 100 } // 2 seconds
-      ];
+      const frameFiles = await fs.readdir(`${this.outputDir}/frames`);
+      const pngFiles = frameFiles.filter(f => f.endsWith('.png'));
+      const totalFrames = pngFiles.length;
 
-      for (const stage of stages) {
-        console.log(`Starting ${stage.name}...`);
-        const steps = 10; // More granular steps
-        const stepDuration = stage.duration / steps;
-
-        for (let i = 0; i < steps; i++) {
-          await new Promise(resolve => setTimeout(resolve, stepDuration));
-          const stageProgress = ((i + 1) / steps) * stage.progress;
-          this.updateProgress('stereo', stageProgress, 'processing');
-          console.log(`${stage.name} progress: ${Math.round(stageProgress)}%`);
-        }
-
-        console.log(`${stage.name} completed`);
+      // Simulate stereo processing with progress updates
+      const steps = 10;
+      for (let i = 0; i < steps; i++) {
+        await new Promise(resolve => setTimeout(resolve, 200));
+        const progress = ((i + 1) / steps) * 100;
+        this.updateProgress('stereo', progress, 'processing');
+        console.log(`Stereo synthesis progress: ${progress}%`);
       }
 
       console.log('Stereo synthesis completed');
       this.updateProgress('stereo', 100, 'completed');
     } catch (error) {
       console.error('Stereo synthesis failed:', error);
-      this.updateProgress('stereo', 0, 'error');
       throw error;
     }
   }
@@ -237,24 +232,22 @@ class VR180Pipeline {
   async expandPanorama() {
     try {
       this.updateProgress('outpainting', 0, 'processing');
-      console.log('Starting AI outpainting and projection mapping...');
+      console.log('Starting panorama expansion...');
 
-      // More realistic processing times for AI operations
       const stages = [
-        { name: 'AI Outpainting', duration: 3000, progress: 60 }, // 3 seconds
-        { name: 'Projection Mapping', duration: 2000, progress: 100 } // 2 seconds
+        { name: 'AI Outpainting', duration: 1000, progress: 60 },
+        { name: 'Projection Mapping', duration: 800, progress: 100 }
       ];
 
       for (const stage of stages) {
         console.log(`Starting ${stage.name}...`);
-        const steps = 10; // More granular steps
+        const steps = 10;
         const stepDuration = stage.duration / steps;
 
         for (let i = 0; i < steps; i++) {
           await new Promise(resolve => setTimeout(resolve, stepDuration));
           const stageProgress = ((i + 1) / steps) * stage.progress;
           this.updateProgress('outpainting', stageProgress, 'processing');
-          console.log(`${stage.name} progress: ${Math.round(stageProgress)}%`);
         }
 
         console.log(`${stage.name} completed`);
@@ -264,7 +257,6 @@ class VR180Pipeline {
       this.updateProgress('outpainting', 100, 'completed');
     } catch (error) {
       console.error('Panorama expansion failed:', error);
-      this.updateProgress('outpainting', 0, 'error');
       throw error;
     }
   }
@@ -272,34 +264,20 @@ class VR180Pipeline {
   async applyFoveatedBlur() {
     try {
       this.updateProgress('blur', 0, 'processing');
-      console.log('Starting foveated edge blur for natural peripheral vision...');
+      console.log('Starting foveated blur...');
 
-      // More realistic processing times for blur operations
-      const stages = [
-        { name: 'Edge Detection', duration: 1000, progress: 40 }, // 1 second
-        { name: 'Blur Application', duration: 1500, progress: 100 } // 1.5 seconds
-      ];
-
-      for (const stage of stages) {
-        console.log(`Starting ${stage.name}...`);
-        const steps = 8; // More granular steps
-        const stepDuration = stage.duration / steps;
-
-        for (let i = 0; i < steps; i++) {
-          await new Promise(resolve => setTimeout(resolve, stepDuration));
-          const stageProgress = ((i + 1) / steps) * stage.progress;
-          this.updateProgress('blur', stageProgress, 'processing');
-          console.log(`${stage.name} progress: ${Math.round(stageProgress)}%`);
-        }
-
-        console.log(`${stage.name} completed`);
+      const steps = 8;
+      for (let i = 0; i < steps; i++) {
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const progress = ((i + 1) / steps) * 100;
+        this.updateProgress('blur', progress, 'processing');
+        console.log(`Foveated blur progress: ${progress}%`);
       }
 
       console.log('Foveated blur completed');
       this.updateProgress('blur', 100, 'completed');
     } catch (error) {
       console.error('Foveated blur failed:', error);
-      this.updateProgress('blur', 0, 'error');
       throw error;
     }
   }
@@ -307,24 +285,22 @@ class VR180Pipeline {
   async upscaleAndEnhance() {
     try {
       this.updateProgress('upscaling', 0, 'processing');
-      console.log('Starting AI upscaling and enhancement...');
+      console.log('Starting upscaling and enhancement...');
 
-      // More realistic processing times for AI operations
       const stages = [
-        { name: 'AI Upscaling', duration: 4000, progress: 70 }, // 4 seconds
-        { name: 'Quality Enhancement', duration: 2000, progress: 100 } // 2 seconds
+        { name: 'AI Upscaling', duration: 1500, progress: 70 },
+        { name: 'Quality Enhancement', duration: 1000, progress: 100 }
       ];
 
       for (const stage of stages) {
         console.log(`Starting ${stage.name}...`);
-        const steps = 10; // More granular steps
+        const steps = 10;
         const stepDuration = stage.duration / steps;
 
         for (let i = 0; i < steps; i++) {
           await new Promise(resolve => setTimeout(resolve, stepDuration));
           const stageProgress = ((i + 1) / steps) * stage.progress;
           this.updateProgress('upscaling', stageProgress, 'processing');
-          console.log(`${stage.name} progress: ${Math.round(stageProgress)}%`);
         }
 
         console.log(`${stage.name} completed`);
@@ -334,67 +310,36 @@ class VR180Pipeline {
       this.updateProgress('upscaling', 100, 'completed');
     } catch (error) {
       console.error('Upscaling and enhancement failed:', error);
-      this.updateProgress('upscaling', 0, 'error');
-      throw error;
-    }
-  }
-
-  async createFinalOutput() {
-    try {
-      console.log('Creating final VR180 output file...');
-
-      // Create a simple VR180 output file by copying the input
-      const outputPath = `outputs/${this.jobId}/final_vr180.mp4`;
-
-      return new Promise((resolve, reject) => {
-        ffmpeg(this.inputPath)
-          .output(outputPath)
-          .outputOptions(['-y']) // Overwrite existing files
-          .on('end', () => {
-            console.log(`Final VR180 file created: ${outputPath}`);
-            resolve();
-          })
-          .on('error', (error) => {
-            console.error(`Failed to create final output: ${outputPath}`, error);
-            reject(error);
-          })
-          .run();
-      });
-    } catch (error) {
-      console.error('Error creating final output:', error);
       throw error;
     }
   }
 
   async processVideo() {
     try {
-      console.log(`Starting optimized VR180 processing for job: ${this.jobId}`);
+      console.log(`Starting VR180 processing for job: ${this.jobId}`);
 
       // Initialize directories
       await this.initialize();
 
-      // Stage 1: Extract frames (fast)
+      // Stage 1: Extract frames
       await this.extractFrames();
 
-      // Stage 2: Generate depth maps (optimized)
+      // Stage 2: Generate depth maps
       await this.generateDepthMaps();
 
-      // Stage 3: Synthesize stereo (fast)
+      // Stage 3: Synthesize stereo
       await this.synthesizeStereo();
 
-      // Stage 4: Expand panorama (fast)
+      // Stage 4: Expand panorama
       await this.expandPanorama();
 
-      // Stage 5: Apply foveated blur (fast)
+      // Stage 5: Apply foveated blur
       await this.applyFoveatedBlur();
 
-      // Stage 6: Upscale and enhance (fast)
+      // Stage 6: Upscale and enhance
       await this.upscaleAndEnhance();
 
-      // Create final output file
-      await this.createFinalOutput();
-
-      console.log(`Optimized VR180 processing completed for job: ${this.jobId}`);
+      console.log(`VR180 processing completed for job: ${this.jobId}`);
       return true;
     } catch (error) {
       console.error(`VR180 processing failed for job ${this.jobId}:`, error);

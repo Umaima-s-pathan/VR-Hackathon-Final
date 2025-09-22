@@ -71,7 +71,7 @@ const ProcessingPage = () => {
     // Real API polling for job status
     const pollJobStatus = async () => {
       try {
-        const response = await fetch(`https://vr-final.onrender.com/api/status/${jobId}`);
+        const response = await fetch(`/api/status/${jobId}`);
         if (response.ok) {
           const jobData = await response.json();
 
@@ -99,7 +99,7 @@ const ProcessingPage = () => {
           // Check if job is completed
           if (jobData.status === 'completed') {
             setIsCompleted(true);
-            setDownloadUrl(`https://vr-final.onrender.com/api/download/${jobId}`);
+            setDownloadUrl(`/api/download/${jobId}`);
           } else if (jobData.status === 'error') {
             setError(jobData.error || 'Processing failed');
           }
